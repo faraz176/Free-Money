@@ -1,28 +1,36 @@
 # Directory: app/services/scraper_core.py
-# This is the main scraper engine, now enhanced with the DynamicQueryBuilder.
+# IMPORTANT: To run this file, navigate to the project's root directory (Free-Money/)
+# and use the command: python -m app.services.scraper_core
+# FIRST TIME SETUP: run `pip install playwright` and then `playwright install`
 
 import asyncio
-import httpx
-import functools
+import random
 from duckduckgo_search import DDGS
-from trafilatura import fetch_url, extract
+from trafilatura import extract
 from typing import List, Set, Optional
-
-# Correctly import from your project structure
-from app.services.dynamic_query_builder import DynamicQueryBuilder
+from playwright.async_api import async_playwright
 
 # --- Configuration ---
-REQUEST_TIMEOUT = 10
 
-# This is our "seed" list, which will be expanded upon.
-SEED_SEARCH_QUERIES = [
+# Comprehensive list of search queries.
+SEARCH_QUERIES = [
+    # Core Credit Card Queries
     "best credit card signup bonus offers",
     "limited time credit card offer",
+    "best credit cards for travel points",
+    "no annual fee credit card bonus",
+    "best cash back credit cards",
+
+    # Community & Forum Queries - Where the best deals surface first
     "best credit card offers flyertalk",
     "new credit card bonus reddit churning",
     "doctor of credit best card bonuses",
-    "high yield savings account bonus 2024",
+    "bogleheads credit card recommendations",
+
+    # Broader Financial Queries
+    "best high yield savings account bonus",
     "brokerage account opening bonus",
+    "best bank account promotions",
 ]
 
 # Domains to exclude from search results
@@ -31,10 +39,11 @@ EXCLUDED_DOMAINS = [
     "linkedin.com", "instagram.com", "pinterest.com", "duckduckgo.com"
 ]
 
-# Failsafe URLs if search fails
+# Failsafe URLs if all web searches fail
 FAILSAFE_URLS = [
     "https://www.doctorofcredit.com/best-credit-card-sign-up-bonuses/",
     "https://www.flyertalk.com/forum/credit-card-programs-599/",
+    "https://frequentmiler.com/best-credit-card-offers/",
     "https://www.nerdwallet.com/best/credit-cards/sign-up-bonus",
 ]
 
@@ -65,8 +74,9 @@ def analyze_opportunity_with_ai(text_content: str, source_url: str) -> Optional[
 
 # --- Core Scraper Class ---
 class ScraperCore:
-    def __init__(self, search_queries: List[str]):
+    def __init__(self, search_queries: List[str], browser):
         self.search_queries = search_queries
+        self.browser = browser
 
     def _is_valid_link(self, url: str) -> bool:
         if not url or not url.startswith("http"): return False
@@ -78,17 +88,25 @@ class ScraperCore:
 
     async def discover_urls(self) -> Set[str]:
         all_links = set()
-        print("🌱 Starting URL discovery using expanded query list...")
+        print(f"🌱 Starting URL discovery for {len(self.search_queries)} queries...")
         try:
             with DDGS() as ddgs:
                 for query in self.search_queries:
                     print(f"  -> Searching for: '{query}'")
-                    results = list(ddgs.text(query, max_results=5))
-                    if not results: continue
+                    results = list(ddgs.text(query, max_results=3)) # Fewer results to be less aggressive
+                    if not results:
+                        print("     - No results found.")
+                        continue
+                    
                     for result in results:
                         url = result.get('href')
                         if self._is_valid_link(url):
                             all_links.add(url)
+                    
+                    delay = random.uniform(4, 8)
+                    print(f"     - Pausing for {delay:.1f} seconds to avoid rate limit...")
+                    await asyncio.sleep(delay)
+
         except Exception as e:
             print(f"❗️❗️ An error during DuckDuckGo search: {e}")
 
@@ -96,7 +114,7 @@ class ScraperCore:
             print("\n⚠️ Live search failed. Switching to failsafe URLs.\n")
             return set(FAILSAFE_URLS)
         
-        print(f"🌱 Discovered {len(all_links)} unique URLs from {len(self.search_queries)} queries.\n")
+        print(f"🌱 Discovered {len(all_links)} unique URLs.\n")
         return all_links
 
     async def process_links(self, urls: Set[str]) -> List[MockOpportunity]:
@@ -105,42 +123,54 @@ class ScraperCore:
         return [result for result in results if result]
 
     async def _fetch_and_analyze(self, url: str) -> Optional[MockOpportunity]:
+        """Uses Playwright to fetch content like a real browser."""
+        page = None
         try:
-            print(f"📰 Fetching: {url}")
-            loop = asyncio.get_running_loop()
-            fetch_with_timeout = functools.partial(fetch_url, url, timeout=REQUEST_TIMEOUT)
-            downloaded = await loop.run_in_executor(None, fetch_with_timeout)
-            if not downloaded:
-                print(f"  - ❗️ Fetch failed for {url} (timed out or blocked).")
-                return None
-            text_content = extract(downloaded, include_comments=False, include_tables=False)
+            print(f"📰 Fetching with Playwright: {url}")
+            page = await self.browser.new_page()
+            await page.goto(url, wait_until='domcontentloaded', timeout=30000) # 30s timeout
+            
+            # Wait for a common sign that the page has settled
+            await page.wait_for_timeout(2000) 
+
+            html_content = await page.content()
+            
+            text_content = extract(html_content, include_comments=False, include_tables=False)
+            
             if not text_content:
                 print(f"  - ❗️ Could not extract main content from {url}.")
                 return None
+            
             return analyze_opportunity_with_ai(text_content, source_url=url)
         except Exception as e:
             print(f"  - ❗️❗️ Unexpected error processing {url}: {e}")
             return None
+        finally:
+            if page:
+                await page.close()
 
 # --- Main Execution Logic ---
 async def main():
-    print("--- SCRIPT STARTED: SELF-EXPANDING MODE ---")
+    print("--- SCRIPT STARTED: PLAYWRIGHT MODE ---")
     
-    query_builder = DynamicQueryBuilder(SEED_SEARCH_QUERIES)
-    dynamic_queries = await query_builder.expand_queries()
-    
-    scraper = ScraperCore(dynamic_queries)
-    
-    urls_to_scan = await scraper.discover_urls()
-    if not urls_to_scan:
-        print("🛑 CRITICAL ERROR: No URLs to scan. Cannot proceed.")
-        return
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        
+        scraper = ScraperCore(SEARCH_QUERIES, browser)
+        
+        urls_to_scan = await scraper.discover_urls()
+        if not urls_to_scan:
+            print("🛑 CRITICAL ERROR: No URLs to scan. Cannot proceed.")
+            await browser.close()
+            return
 
-    print(f"🕵️ Processing {len(urls_to_scan)} URLs through the AI filter...")
-    all_opportunities = await scraper.process_links(urls_to_scan)
-    
+        print(f"🕵️ Processing {len(urls_to_scan)} URLs through the AI filter...")
+        all_opportunities = await scraper.process_links(urls_to_scan)
+        
+        await browser.close()
+        
     final_opportunities = [opp for opp in all_opportunities if opp.trust_score >= 5]
-    print(f"✅ Found {len(final_opportunities)} valid opportunities with trust score >= 5:\n")
+    print(f"\n✅ Found {len(final_opportunities)} valid opportunities with trust score >= 5:\n")
 
     if final_opportunities:
         final_opportunities.sort(key=lambda x: x.trust_score, reverse=True)

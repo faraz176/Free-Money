@@ -5,10 +5,16 @@ import asyncio
 import httpx
 from bs4 import BeautifulSoup
 from typing import List, Set
+import urllib.parse
 
 # Headers to mimic a real browser visit for scraping Google
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'DNT': '1',
+    'Upgrade-Insecure-Requests': '1'
 }
 
 class DynamicQueryBuilder:
@@ -40,34 +46,53 @@ class DynamicQueryBuilder:
         Scrapes a Google search results page for a single query to find related terms.
         """
         try:
-            # URL-encode the query
-            encoded_query = httpx.URL(query).path.encode('utf-8')
-            search_url = f"https://www.google.com/search?q={encoded_query.decode()}"
+            # URL-encode the query properly
+            encoded_query = urllib.parse.quote_plus(query)
+            search_url = f"https://www.google.com/search?q={encoded_query}&gl=us&hl=en"
             print(f"  -> Expanding from seed: '{query}'")
             response = await client.get(search_url)
             
             if response.status_code != 200:
                 print(f"  - ❗️ Failed to fetch Google results for '{query}'. Status: {response.status_code}")
+                # Optional: Write response.text to a file for debugging what Google sent back
+                # with open(f"error_{query[:10]}.html", "w", encoding="utf-8") as f:
+                #     f.write(response.text)
                 return
 
             soup = BeautifulSoup(response.text, 'html.parser')
             
-            # This selector is more robust for finding "Related searches"
-            related_search_links = soup.select("div[data-st-mc] a, a[id^='rl_']")
+            # --- NEW ROBUST METHOD ---
+            # Instead of a single selector, we check multiple known containers.
+            found_new_terms = set()
+            
+            # Selector for the main "Related searches" block at the bottom
+            related_searches_div = soup.find('div', id='bres')
+            if related_searches_div:
+                links = related_searches_div.find_all('a')
+                for link in links:
+                    found_new_terms.add(link.get_text(strip=True))
 
-            found_new_term = False
-            for link in related_search_links:
-                related_term = link.get_text(strip=True)
-                if related_term and related_term.lower() not in self.expanded_queries:
-                    # More robust check for junk terms
-                    if "see more" in related_term.lower() or "search" in related_term.lower() or len(related_term) > 100:
+            # Selector for "People also ask" sections
+            people_also_ask_divs = soup.find_all('div', jsname='Cpkphb')
+            for div in people_also_ask_divs:
+                question = div.find('span')
+                if question:
+                    found_new_terms.add(question.get_text(strip=True))
+            
+            # Clean and filter the collected terms
+            final_new_terms = []
+            for term in found_new_terms:
+                if term and len(term) > 3 and term.lower() not in self.expanded_queries:
+                    if "›" in term or "See more" in term:
                         continue
-                    self.expanded_queries.add(related_term)
-                    found_new_term = True
+                    final_new_terms.append(term)
 
-            if not found_new_term:
-                print(f"  - No new related terms found for '{query}'.")
+
+            if final_new_terms:
+                print(f"  - Found new terms: {final_new_terms}")
+                self.expanded_queries.update(final_new_terms)
+            else:
+                print(f"  - No new related terms found for '{query}'. Google's layout may have changed.")
 
         except Exception as e:
             print(f"  - ❗️❗️ An error occurred while expanding query '{query}': {e}")
-
